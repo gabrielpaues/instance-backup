@@ -265,6 +265,16 @@ def upload_to_s3(
         multipart_chunksize=50 * 1024 * 1024,   # 50 MB parts
         max_concurrency=4,
     )
+    from botocore.exceptions import ClientError as _BotoClientError
+    try:
+        s3_client.head_bucket(Bucket=bucket)
+    except _BotoClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchBucket"):
+            logger.info("Bucket '%s' not found, creating it...", bucket)
+            s3_client.create_bucket(Bucket=bucket)
+        else:
+            raise
+
     logger.info("Uploading to s3://%s/%s ...", bucket, s3_key)
     s3_client.upload_file(str(local_path), bucket, s3_key, Config=transfer_config)
     logger.info("Upload complete")
