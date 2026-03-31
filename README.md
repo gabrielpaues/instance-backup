@@ -44,6 +44,23 @@ python backup.py --config config.yaml
 S3 credentials can be set via environment variables instead of the config file:
 `BACKUP_S3_ENDPOINT`, `BACKUP_S3_REGION`, `BACKUP_S3_ACCESS_KEY`, `BACKUP_S3_SECRET_KEY`
 
+When using a named AWS profile (`aws_profile` in config or `BACKUP_S3_PROFILE` env var), the profile must exist in `~/.aws/config` and the credentials in `~/.aws/credentials`:
+
+**`~/.aws/config`**
+```ini
+[profile backup-user]
+region = eu-north-1
+```
+
+**`~/.aws/credentials`**
+```ini
+[backup-user]
+aws_access_key_id = <access_key_id>
+aws_secret_access_key = <secret_access_key>
+```
+
+Note: the profile name in `~/.aws/credentials` does not include the `profile ` prefix that `~/.aws/config` uses.
+
 ## Retention policy (GFS)
 
 Three independent rules — a backup satisfying any one is kept. A single S3 object can satisfy multiple rules without duplication.
