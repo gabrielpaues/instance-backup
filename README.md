@@ -49,7 +49,9 @@ When using a named AWS profile (`aws_profile` in config or `BACKUP_S3_PROFILE` e
 **`~/.aws/config`**
 ```ini
 [profile backup-user]
-region = eu-north-1
+endpoint_url = https://<s3-endpoint>
+s3 =
+  addressing_style = path
 ```
 
 **`~/.aws/credentials`**
@@ -59,7 +61,7 @@ aws_access_key_id = <access_key_id>
 aws_secret_access_key = <secret_access_key>
 ```
 
-Note: the profile name in `~/.aws/credentials` does not include the `profile ` prefix that `~/.aws/config` uses.
+Note: the profile name in `~/.aws/credentials` does not include the `profile ` prefix that `~/.aws/config` uses. `addressing_style = path` is required for S3-compatible endpoints.
 
 ## Retention policy (GFS)
 
