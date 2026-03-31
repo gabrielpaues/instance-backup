@@ -1,0 +1,132 @@
+# =============================================================================
+# OpenStack Instance Backup Configuration
+# =============================================================================
+#
+# This file defines which servers to back up, where to store backups (S3),
+# and how long to retain them using a Grandfather-Father-Son (GFS) scheme.
+#
+# OpenStack credentials are read from clouds.yaml (standard OpenStack format).
+# The default search paths are:
+#   - ./clouds.yaml
+#   - ~/.config/openstack/clouds.yaml
+#   - /etc/openstack/clouds.yaml
+#
+# S3 credentials can be provided here or via environment variables:
+#   BACKUP_S3_ENDPOINT   BACKUP_S3_REGION
+#   BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY
+# Environment variables take precedence over values in this file.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# S3 connection settings
+# -----------------------------------------------------------------------------
+s3:
+  endpoint_url: "https://s3.amazonaws.com"   # Use a custom URL for non-AWS S3
+  region_name: "eu-west-1"
+
+  # Authentication — choose one of the three options below:
+  #
+  # Option 1: named profile from ~/.aws/config or ~/.aws/credentials
+  aws_profile: "backup-user"                 # or set BACKUP_S3_PROFILE
+  #
+  # Option 2: explicit credentials (override aws_profile if both are set)
+  # access_key: "AKIAIOSFODNN7EXAMPLE"       # or set BACKUP_S3_ACCESS_KEY
+  # secret_key: "wJalrXUtnFEMI/K7MDENGbPxRfi" # or set BACKUP_S3_SECRET_KEY
+  #
+  # Option 3: omit all of the above to fall back on the default boto3 credential
+  # chain (instance role, env vars, default profile, etc.)
+
+# -----------------------------------------------------------------------------
+# Local temp directory for downloading snapshots before uploading to S3.
+# Needs enough free space to hold one full snapshot at a time.
+# -----------------------------------------------------------------------------
+temp_dir: "/tmp/openstack-backups"
+
+# -----------------------------------------------------------------------------
+# Global GFS retention policy — applied to every server unless overridden.
+#
+#   daily:          Keep the N most recent backups (regardless of day).
+#   weekly:         Keep one backup per week for the last N weeks.
+#   weekly_weekday: Preferred day of week for the weekly backup (0=Mon, 6=Sun).
+#                   If no backup exists on that day, the nearest available
+#                   backup within the same calendar week is used.
+#   monthly:        Keep one backup per month for the last N months.
+#   monthly_day:    Preferred day of month for the monthly backup (1–28).
+#                   If no backup exists on that day, the nearest available
+#                   backup within the same calendar month is used.
+#
+# Example: daily=7, weekly=4, monthly=6 keeps roughly 7 days, 4 weeks, and
+# 6 months of history. A single backup can satisfy multiple rules — there is
+# no duplication in S3.
+# -----------------------------------------------------------------------------
+retention:
+  daily: 7
+  weekly: 4
+  weekly_weekday: 0   # Monday
+  monthly: 6
+  monthly_day: 1      # 1st of the month
+
+# -----------------------------------------------------------------------------
+# Servers to back up
+# Each entry requires:
+#   cloud:   Name matching a key under 'clouds:' in your clouds.yaml
+#   name:    OpenStack server name (must be unique within that project)
+#   bucket:  S3 bucket to store backups in
+#
+# Optional:
+#   prefix:    Path prefix inside the bucket (default: ""). The final S3 key
+#              will be: {prefix}/{name}/{name}-{YYYY-MM-DD}.{format}
+#   retention: Per-server override of the global retention settings above.
+#              Only the keys you specify are overridden; the rest inherit
+#              from the global defaults.
+# -----------------------------------------------------------------------------
+servers:
+  - cloud: "production"
+    name: "web-server-01"
+    bucket: "my-openstack-backups"
+    prefix: "prod"
+
+  - cloud: "production"
+    name: "db-server-01"
+    bucket: "my-openstack-backups"
+    prefix: "prod"
+    retention:
+      daily: 14       # Keep two weeks of daily backups for the database
+      weekly: 8
+      monthly: 12
+      monthly_day: 1
+
+  - cloud: "staging"
+    name: "app-server-staging"
+    bucket: "my-openstack-backups"
+    prefix: "staging"
+    retention:
+      daily: 3
+      weekly: 2
+      monthly: 1
+
+# =============================================================================
+# Example clouds.yaml (place at ~/.config/openstack/clouds.yaml):
+#
+# clouds:
+#   production:
+#     auth:
+#       auth_url: https://keystone.example.com:5000/v3
+#       username: backup-user
+#       password: s3cr3t
+#       project_name: my-project
+#       user_domain_name: Default
+#       project_domain_name: Default
+#     region_name: RegionOne
+#     interface: public
+#     identity_api_version: 3
+#
+#   staging:
+#     auth:
+#       auth_url: https://keystone-staging.example.com:5000/v3
+#       application_credential_id: abc123
+#       application_credential_secret: xyz789
+#     region_name: RegionOne
+#     interface: public
+#     identity_api_version: 3
+# =============================================================================
