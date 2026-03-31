@@ -212,12 +212,13 @@ def _create_bfv_snapshot(conn, server_name: str, server_id: str, snapshot_name: 
     """
     Create a downloadable Glance image from a boot-from-volume server.
     Pipeline: boot volume → Cinder snapshot → temp volume → Glance image.
-    Returns (image_id, disk_format).
+    Returns (image_id, disk_format, cinder_snap_id, tmp_volume_id).
+    The caller is responsible for deleting cinder_snap_id and tmp_volume_id after download.
+    On failure, intermediate resources are cleaned up before re-raising.
     """
     cinder_snap_id = None
     tmp_volume_id = None
     image_id = None
-    success = False
 
     try:
         boot_volume_id = _get_boot_volume_id(conn, server_id)
@@ -253,7 +254,7 @@ def _create_bfv_snapshot(conn, server_name: str, server_id: str, snapshot_name: 
         if tmp_vol is None:
             raise RuntimeError("Temporary volume did not become available within timeout")
 
-        # 3. Upload volume as a Glance image
+        # 3. Upload volume as a Glance image and wait for it to be active
         logger.info("Uploading volume to Glance as '%s'...", snapshot_name)
         image_meta = conn.block_storage.upload_volume_to_image(
             tmp_vol,
@@ -272,29 +273,28 @@ def _create_bfv_snapshot(conn, server_name: str, server_id: str, snapshot_name: 
             raise RuntimeError("BFV Glance image did not become active within timeout")
 
         disk_format = image.disk_format or "qcow2"
-        logger.info("BFV snapshot ready: id=%s, format=%s, size=%s bytes", image_id, disk_format, image.size)
-        success = True
-        return image_id, disk_format
+        logger.info("BFV Glance image ready: id=%s, format=%s, size=%s bytes", image_id, disk_format, image.size)
+        # Return resource IDs so the caller can delete them after downloading the image
+        return image_id, disk_format, cinder_snap_id, tmp_volume_id
 
-    finally:
-        # Delete temp volume before snapshot (Cinder may enforce this order)
+    except Exception:
+        # Clean up any intermediate resources created before the failure
         if tmp_volume_id:
             try:
                 conn.block_storage.delete_volume(tmp_volume_id)
-                logger.info("Deleted temporary Cinder volume %s", tmp_volume_id)
-            except Exception as e:
-                logger.warning("Failed to delete temporary Cinder volume %s: %s", tmp_volume_id, e)
+            except Exception:
+                pass
         if cinder_snap_id:
             try:
                 conn.block_storage.delete_snapshot(cinder_snap_id)
-                logger.info("Deleted Cinder snapshot %s", cinder_snap_id)
-            except Exception as e:
-                logger.warning("Failed to delete Cinder snapshot %s: %s", cinder_snap_id, e)
-        if not success and image_id:
+            except Exception:
+                pass
+        if image_id:
             try:
                 conn.image.delete_image(image_id)
             except Exception:
                 pass
+        raise
 
 
 def _wait_for_image_active(conn, image_id: str, logger: logging.Logger, interval: int = 30, timeout: int = 7200):
@@ -319,7 +319,9 @@ def create_snapshot(
 ) -> tuple:
     """
     Create (or reuse) a Glance snapshot of the server.
-    Returns (image_id, disk_format).
+    Returns (image_id, disk_format, cinder_snap_id, tmp_volume_id).
+    cinder_snap_id and tmp_volume_id are None for ephemeral servers; the caller
+    must delete them after downloading the image for BFV servers.
     """
     existing_id = _find_existing_snapshot(conn, snapshot_name)
     if existing_id:
@@ -331,12 +333,14 @@ def create_snapshot(
             if image is None:
                 raise RuntimeError(f"Snapshot '{snapshot_name}' did not become active within timeout")
         disk_format = image.disk_format or "raw"
-        return existing_id, disk_format
+        return existing_id, disk_format, None, None
 
     server = conn.compute.find_server(server_name, ignore_missing=False)
 
-    # Boot-from-volume servers have no image reference
-    if not server.image:
+    # Detect boot-from-volume by checking for a boot volume attachment.
+    # server.image may still be set to the base image even on BFV servers,
+    # so volume attachments are the reliable signal.
+    if _get_boot_volume_id(conn, server.id):
         return _create_bfv_snapshot(conn, server_name, server.id, snapshot_name, logger)
 
     logger.info("Creating snapshot '%s' for server '%s' (id=%s)", snapshot_name, server_name, server.id)
@@ -348,7 +352,7 @@ def create_snapshot(
         raise RuntimeError(f"Snapshot '{snapshot_name}' did not become active within timeout")
     disk_format = image.disk_format or "raw"
     logger.info("Snapshot ready: id=%s, format=%s, size=%s bytes", image_id, disk_format, image.size)
-    return image_id, disk_format
+    return image_id, disk_format, None, None
 
 
 def download_snapshot(
@@ -395,7 +399,7 @@ def _s3_key(server: ServerConfig, snapshot_name: str, disk_format: str) -> str:
 
 
 def _metadata_s3_key(server: ServerConfig) -> str:
-    parts = [p for p in [server.prefix, server.name, "server-metadata.json"] if p]
+    parts = [p for p in [server.prefix, server.name, f"{server.name}-metadata.json"] if p]
     return "/".join(parts)
 
 
@@ -616,16 +620,36 @@ def backup_server(
 ) -> bool:
     snapshot_name = f"{server.name}-{today.isoformat()}"
     image_id = None
+    cinder_snap_id = None
+    tmp_volume_id = None
     conn = None
 
     try:
         conn = openstack.connect(cloud=server.cloud)
 
         # 1. Create / reuse snapshot
-        image_id, disk_format = create_snapshot(conn, server.name, snapshot_name, logger)
+        image_id, disk_format, cinder_snap_id, tmp_volume_id = create_snapshot(
+            conn, server.name, snapshot_name, logger
+        )
 
         # 2. Download to temp
         local_path = download_snapshot(conn, image_id, snapshot_name, disk_format, temp_dir, logger)
+
+        # 2b. BFV cleanup: delete temp volume and Cinder snapshot now that we have the image locally
+        if tmp_volume_id:
+            try:
+                conn.block_storage.delete_volume(tmp_volume_id)
+                logger.info("Deleted temporary Cinder volume %s", tmp_volume_id)
+            except Exception as e:
+                logger.warning("Failed to delete temporary Cinder volume %s: %s", tmp_volume_id, e)
+            tmp_volume_id = None
+        if cinder_snap_id:
+            try:
+                conn.block_storage.delete_snapshot(cinder_snap_id)
+                logger.info("Deleted Cinder snapshot %s", cinder_snap_id)
+            except Exception as e:
+                logger.warning("Failed to delete Cinder snapshot %s: %s", cinder_snap_id, e)
+            cinder_snap_id = None
 
         # 3. Upload to S3
         s3_key = _s3_key(server, snapshot_name, disk_format)

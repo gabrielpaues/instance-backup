@@ -160,7 +160,7 @@ class SnapshotEntry:
 
 
 def _metadata_s3_key(server: ServerConfig) -> str:
-    parts = [p for p in [server.prefix, server.name, "server-metadata.json"] if p]
+    parts = [p for p in [server.prefix, server.name, f"{server.name}-metadata.json"] if p]
     return "/".join(parts)
 
 
