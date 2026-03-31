@@ -160,6 +160,20 @@ def _find_existing_snapshot(conn, snapshot_name: str) -> Optional[str]:
     return None
 
 
+def _wait_for_image_active(conn, image_id: str, logger: logging.Logger, interval: int = 30, timeout: int = 7200):
+    """Poll until image reaches active status. Returns the image object or None on timeout/failure."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        image = conn.image.get_image(image_id)
+        if image.status == "active":
+            return image
+        if image.status in ("error", "killed"):
+            raise RuntimeError(f"Image {image_id} entered failed state: {image.status}")
+        time.sleep(interval)
+    return None
+
+
 def create_snapshot(
     conn,
     server_name: str,
@@ -176,14 +190,9 @@ def create_snapshot(
         image = conn.image.get_image(existing_id)
         if image.status != "active":
             logger.info("Waiting for existing snapshot to become active...")
-            conn.image.wait_for_image(
-                existing_id,
-                status="active",
-                failures=["error", "killed"],
-                interval=30,
-                wait=7200,
-            )
-            image = conn.image.get_image(existing_id)
+            image = _wait_for_image_active(conn, existing_id, logger)
+            if image is None:
+                raise RuntimeError(f"Snapshot '{snapshot_name}' did not become active within timeout")
         disk_format = image.disk_format or "raw"
         return existing_id, disk_format
 
@@ -192,15 +201,9 @@ def create_snapshot(
     image_id = conn.compute.create_server_image(server.id, name=snapshot_name)
 
     logger.info("Waiting for snapshot to become active (this may take a while)...")
-    conn.image.wait_for_image(
-        image_id,
-        status="active",
-        failures=["error", "killed"],
-        interval=30,
-        wait=7200,
-    )
-
-    image = conn.image.get_image(image_id)
+    image = _wait_for_image_active(conn, image_id, logger)
+    if image is None:
+        raise RuntimeError(f"Snapshot '{snapshot_name}' did not become active within timeout")
     disk_format = image.disk_format or "raw"
     logger.info("Snapshot ready: id=%s, format=%s, size=%s bytes", image_id, disk_format, image.size)
     return image_id, disk_format

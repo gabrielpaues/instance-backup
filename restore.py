@@ -308,13 +308,17 @@ def upload_to_glance(
     conn.image.upload_image(image.id, filename=str(local_path))
 
     log.info("Waiting for image to become active...")
-    conn.image.wait_for_image(
-        image.id,
-        status="active",
-        failures=["error", "killed"],
-        interval=15,
-        wait=3600,
-    )
+    import time
+    deadline = time.monotonic() + 3600
+    while time.monotonic() < deadline:
+        img = conn.image.get_image(image.id)
+        if img.status == "active":
+            break
+        if img.status in ("error", "killed"):
+            raise RuntimeError(f"Image {image.id} entered failed state: {img.status}")
+        time.sleep(15)
+    else:
+        raise RuntimeError(f"Image {image.id} did not become active within timeout")
     log.info("Image ready: id=%s name='%s'", image.id, image_name)
     return image.id
 
