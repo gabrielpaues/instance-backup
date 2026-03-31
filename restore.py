@@ -297,17 +297,15 @@ def upload_to_glance(
     Create a Glance image from a local file.
     Returns the new image ID.
     """
-    log.info("Creating Glance image '%s' (format: %s)...", image_name, disk_format)
+    log.info("Creating Glance image '%s' (format: %s) and uploading data...", image_name, disk_format)
     image = conn.image.create_image(
         name=image_name,
         disk_format=disk_format,
         container_format="bare",
         visibility="private",
+        filename=str(local_path),
     )
-    log.info("Uploading image data to Glance (id=%s)...", image.id)
-    conn.image.upload_image(image, filename=str(local_path))
-
-    log.info("Waiting for image to become active...")
+    log.info("Upload complete (id=%s), waiting for image to become active...", image.id)
     import time
     deadline = time.monotonic() + 3600
     while time.monotonic() < deadline:
