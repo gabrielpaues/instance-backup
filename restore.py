@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -156,6 +157,34 @@ class SnapshotEntry:
     backup_date: date
     disk_format: str
     size_bytes: int = 0
+
+
+def _metadata_s3_key(server: ServerConfig) -> str:
+    parts = [p for p in [server.prefix, server.name, "server-metadata.json"] if p]
+    return "/".join(parts)
+
+
+def load_server_metadata(s3_client, server: ServerConfig) -> dict:
+    """Load the server metadata JSON written by backup.py, or return an empty dict."""
+    try:
+        key = _metadata_s3_key(server)
+        resp = s3_client.get_object(Bucket=server.bucket, Key=key)
+        return json.loads(resp["Body"].read())
+    except Exception:
+        return {}
+
+
+def _build_server_create_cmd(image_id: str, metadata: dict) -> str:
+    parts = [f"openstack server create --image {image_id}"]
+    parts.append(f"--flavor {metadata['flavor']}" if metadata.get("flavor") else "--flavor <flavor>")
+    if metadata.get("key_name"):
+        parts.append(f"--key-name {metadata['key_name']}")
+    for net in metadata.get("networks", []):
+        parts.append(f"--network {net}")
+    if not metadata.get("networks"):
+        parts.append("--network <network>")
+    parts.append("<new-server-name>")
+    return " ".join(parts)
 
 
 def list_snapshots(s3_client, server: ServerConfig) -> list:
@@ -402,6 +431,7 @@ Examples:
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     s3_client = build_s3_client(config)
+    metadata = load_server_metadata(s3_client, server_cfg)
 
     # List available snapshots
     log.info("Listing snapshots for '%s' in s3://%s ...", args.server, server_cfg.bucket)
@@ -444,7 +474,7 @@ Examples:
             print(f"  Cloud      : {server_cfg.cloud}")
             print()
             print("To launch a new instance from this image:")
-            print(f"  openstack server create --image {existing.id} --flavor <flavor> --network <network> <new-server-name>")
+            print(f"  {_build_server_create_cmd(existing.id, metadata)}")
             print()
             conn.close()
             sys.exit(0)
@@ -480,7 +510,7 @@ Examples:
     print(f"  Cloud      : {server_cfg.cloud}")
     print()
     print("To launch a new instance from this image:")
-    print(f"  openstack server create --image {image_id} --flavor <flavor> --network <network> <new-server-name>")
+    print(f"  {_build_server_create_cmd(image_id, metadata)}")
     print()
 
 

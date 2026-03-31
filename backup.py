@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -153,11 +154,147 @@ def build_s3_client(config: AppConfig):
 # ---------------------------------------------------------------------------
 
 def _find_existing_snapshot(conn, snapshot_name: str) -> Optional[str]:
-    """Return image_id if a snapshot with this name already exists."""
+    """Return image_id if a snapshot with this name already exists and has data (size > 0)."""
     image = conn.image.find_image(snapshot_name)
     if image:
+        if image.size == 0:
+            # Zero-size image is a leftover from a failed BFV backup; discard it
+            try:
+                conn.image.delete_image(image.id)
+            except Exception:
+                pass
+            return None
         return image.id
     return None
+
+
+def _wait_for_volume_snapshot(conn, snapshot_id: str, logger: logging.Logger, interval: int = 15, timeout: int = 3600):
+    """Poll until a Cinder snapshot reaches 'available' status."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        snap = conn.block_storage.get_snapshot(snapshot_id)
+        if snap.status == "available":
+            return snap
+        if snap.status == "error":
+            raise RuntimeError(f"Cinder snapshot {snapshot_id} entered error state")
+        time.sleep(interval)
+    return None
+
+
+def _wait_for_volume_available(conn, volume_id: str, logger: logging.Logger, interval: int = 15, timeout: int = 3600):
+    """Poll until a Cinder volume reaches 'available' status."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        vol = conn.block_storage.get_volume(volume_id)
+        if vol.status == "available":
+            return vol
+        if vol.status == "error":
+            raise RuntimeError(f"Cinder volume {volume_id} entered error state")
+        time.sleep(interval)
+    return None
+
+
+def _get_boot_volume_id(conn, server_id: str) -> Optional[str]:
+    """Return the Cinder volume ID of the boot disk for a BFV server."""
+    attachments = list(conn.compute.volume_attachments(server_id))
+    for att in attachments:
+        if getattr(att, "boot_index", None) == 0:
+            return att.volume_id
+    # Fallback: single attachment must be the boot disk
+    if len(attachments) == 1:
+        return attachments[0].volume_id
+    return None
+
+
+def _create_bfv_snapshot(conn, server_name: str, server_id: str, snapshot_name: str, logger: logging.Logger) -> tuple:
+    """
+    Create a downloadable Glance image from a boot-from-volume server.
+    Pipeline: boot volume → Cinder snapshot → temp volume → Glance image.
+    Returns (image_id, disk_format).
+    """
+    cinder_snap_id = None
+    tmp_volume_id = None
+    image_id = None
+    success = False
+
+    try:
+        boot_volume_id = _get_boot_volume_id(conn, server_id)
+        if not boot_volume_id:
+            raise RuntimeError(f"Cannot find boot volume for server '{server_name}'")
+
+        logger.info("Boot-from-volume server detected (boot volume: %s)", boot_volume_id)
+
+        # 1. Cinder snapshot of the boot volume
+        logger.info("Creating Cinder snapshot '%s'...", snapshot_name)
+        snap = conn.block_storage.create_snapshot(
+            volume_id=boot_volume_id,
+            name=snapshot_name,
+            force=True,
+        )
+        cinder_snap_id = snap.id
+
+        logger.info("Waiting for Cinder snapshot to become available...")
+        snap = _wait_for_volume_snapshot(conn, cinder_snap_id, logger)
+        if snap is None:
+            raise RuntimeError("Cinder snapshot did not become available within timeout")
+
+        # 2. Temporary volume from the snapshot
+        logger.info("Creating temporary volume from Cinder snapshot %s...", cinder_snap_id)
+        tmp_vol = conn.block_storage.create_volume(
+            name=f"{snapshot_name}-tmp",
+            snapshot_id=cinder_snap_id,
+        )
+        tmp_volume_id = tmp_vol.id
+
+        logger.info("Waiting for temporary volume to become available...")
+        tmp_vol = _wait_for_volume_available(conn, tmp_volume_id, logger)
+        if tmp_vol is None:
+            raise RuntimeError("Temporary volume did not become available within timeout")
+
+        # 3. Upload volume as a Glance image
+        logger.info("Uploading volume to Glance as '%s'...", snapshot_name)
+        image_meta = conn.block_storage.upload_volume_to_image(
+            tmp_vol,
+            image_name=snapshot_name,
+            disk_format="qcow2",
+            container_format="bare",
+            force=False,
+        )
+        image_id = image_meta.get("image_id") if isinstance(image_meta, dict) else getattr(image_meta, "image_id", None)
+        if not image_id:
+            raise RuntimeError("upload_volume_to_image did not return an image ID")
+
+        logger.info("Waiting for Glance image %s to become active...", image_id)
+        image = _wait_for_image_active(conn, image_id, logger)
+        if image is None:
+            raise RuntimeError("BFV Glance image did not become active within timeout")
+
+        disk_format = image.disk_format or "qcow2"
+        logger.info("BFV snapshot ready: id=%s, format=%s, size=%s bytes", image_id, disk_format, image.size)
+        success = True
+        return image_id, disk_format
+
+    finally:
+        # Delete temp volume before snapshot (Cinder may enforce this order)
+        if tmp_volume_id:
+            try:
+                conn.block_storage.delete_volume(tmp_volume_id)
+                logger.info("Deleted temporary Cinder volume %s", tmp_volume_id)
+            except Exception as e:
+                logger.warning("Failed to delete temporary Cinder volume %s: %s", tmp_volume_id, e)
+        if cinder_snap_id:
+            try:
+                conn.block_storage.delete_snapshot(cinder_snap_id)
+                logger.info("Deleted Cinder snapshot %s", cinder_snap_id)
+            except Exception as e:
+                logger.warning("Failed to delete Cinder snapshot %s: %s", cinder_snap_id, e)
+        if not success and image_id:
+            try:
+                conn.image.delete_image(image_id)
+            except Exception:
+                pass
 
 
 def _wait_for_image_active(conn, image_id: str, logger: logging.Logger, interval: int = 30, timeout: int = 7200):
@@ -197,6 +334,11 @@ def create_snapshot(
         return existing_id, disk_format
 
     server = conn.compute.find_server(server_name, ignore_missing=False)
+
+    # Boot-from-volume servers have no image reference
+    if not server.image:
+        return _create_bfv_snapshot(conn, server_name, server.id, snapshot_name, logger)
+
     logger.info("Creating snapshot '%s' for server '%s' (id=%s)", snapshot_name, server_name, server.id)
     image_id = conn.compute.create_server_image(server.id, name=snapshot_name)
 
@@ -250,6 +392,47 @@ def download_snapshot(
 def _s3_key(server: ServerConfig, snapshot_name: str, disk_format: str) -> str:
     parts = [p for p in [server.prefix, server.name, f"{snapshot_name}.{disk_format}"] if p]
     return "/".join(parts)
+
+
+def _metadata_s3_key(server: ServerConfig) -> str:
+    parts = [p for p in [server.prefix, server.name, "server-metadata.json"] if p]
+    return "/".join(parts)
+
+
+def save_server_metadata(conn, server: ServerConfig, s3_client, logger: logging.Logger):
+    """Fetch server properties and write a metadata JSON to S3 for use by restore.py."""
+    try:
+        os_server = conn.compute.find_server(server.name, ignore_missing=True)
+        if not os_server:
+            return
+
+        # Flavor name
+        flavor_name = None
+        if os_server.flavor:
+            flavor_name = os_server.flavor.get("original_name") or os_server.flavor.get("name")
+            if not flavor_name:
+                flavor_id = os_server.flavor.get("id")
+                if flavor_id:
+                    try:
+                        flavor_name = conn.compute.get_flavor(flavor_id).name
+                    except Exception:
+                        flavor_name = flavor_id
+
+        metadata = {
+            "flavor": flavor_name,
+            "key_name": os_server.key_name,
+            "networks": list(os_server.addresses.keys()) if os_server.addresses else [],
+        }
+
+        key = _metadata_s3_key(server)
+        s3_client.put_object(
+            Bucket=server.bucket,
+            Key=key,
+            Body=json.dumps(metadata, indent=2).encode(),
+        )
+        logger.info("Saved server metadata to s3://%s/%s", server.bucket, key)
+    except Exception as e:
+        logger.warning("Failed to save server metadata: %s", e)
 
 
 def upload_to_s3(
@@ -447,6 +630,9 @@ def backup_server(
         # 3. Upload to S3
         s3_key = _s3_key(server, snapshot_name, disk_format)
         upload_to_s3(s3_client, server.bucket, s3_key, local_path, logger)
+
+        # 3b. Save server metadata (flavor, keypair, networks) for restore
+        save_server_metadata(conn, server, s3_client, logger)
 
         # 4. Delete Glance snapshot (free quota)
         conn.image.delete_image(image_id)
