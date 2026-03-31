@@ -305,8 +305,7 @@ def upload_to_glance(
         visibility="private",
     )
     log.info("Uploading image data to Glance (id=%s)...", image.id)
-    conn.image.update_image(image.id, disk_format=disk_format, container_format="bare")
-    conn.image.upload_image(image.id, filename=str(local_path))
+    conn.image.upload_image(image, filename=str(local_path))
 
     log.info("Waiting for image to become active...")
     import time
