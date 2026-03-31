@@ -129,4 +129,24 @@ servers:
 #     region_name: RegionOne
 #     interface: public
 #     identity_api_version: 3
+#
+# =============================================================================
+# Example ~/.aws/config (when using aws_profile above):
+#
+# [profile backup-user]
+# endpoint_url = https://<s3-endpoint>
+# s3 =
+#   addressing_style = path
+#
+# Note: addressing_style = path is required for S3-compatible endpoints.
+#
+# =============================================================================
+# Example ~/.aws/credentials:
+#
+# [backup-user]
+# aws_access_key_id = <access_key_id>
+# aws_secret_access_key = <secret_access_key>
+#
+# Note: the profile name in ~/.aws/credentials does not use the "profile "
+# prefix that ~/.aws/config uses.
 # =============================================================================
